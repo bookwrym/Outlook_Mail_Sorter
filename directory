@@ -4,8 +4,6 @@ from bs4 import BeautifulSoup
 
 URL = "https://www.purdue.edu/directory/"
 
-# --- Classification rules ---
-# Professor FIRST so GTA is treated as PROFESSOR.
 PROF_REGEX = re.compile(
     r"""
     \b(
@@ -96,3 +94,4 @@ while True:
         if p.get("Department"):
             print(f"Department: {p['Department']}")
         print()
+
