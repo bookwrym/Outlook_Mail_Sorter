@@ -1,0 +1,98 @@
+import re
+import requests
+from bs4 import BeautifulSoup
+
+URL = "https://www.purdue.edu/directory/"
+
+# --- Classification rules ---
+# Professor FIRST so GTA is treated as PROFESSOR.
+PROF_REGEX = re.compile(
+    r"""
+    \b(
+        professor|faculty|
+        assistant\s*professor|associate\s*professor|full\s*professor|
+        clinical\s*(assistant|associate)?\s*professor|
+        visiting\s*professor|adjunct\s*professor|
+        lecturer|senior\s*lecturer|
+        graduate\s*teaching\s*assistant|gta
+    )\b
+    """,
+    re.I | re.X,
+)
+
+# TA is intentionally narrow (your request)
+TA_REGEX = re.compile(
+    r"""
+    \b(
+        ta|
+        ugta|
+        undergraduate\s*teaching\s*assistant|
+        undergrad\s*teaching\s*assistant|
+        undergrad\s*ta
+    )\b
+    """,
+    re.I | re.X,
+)
+
+def classify_position(title: str | None) -> str:
+    if not title:
+        return "STUDENT"
+    t = title.strip()
+    # Order matters: professor first (so GTA ⇒ PROFESSOR)
+    if PROF_REGEX.search(t):
+        return "PROFESSOR"
+    if TA_REGEX.search(t):
+        return "TA"
+    return "STAFF"
+
+
+while True:
+    email_input = input("Enter Purdue email (or STOP): ").strip()
+    alias_input, domain_input = email_input.split("@")
+    if domain_input != "purdue.edu":
+        print("Not a Purdue Email.")
+        break
+    if alias_input.upper() == "STOP":
+        break
+
+    alias = alias_input.split("@", 1)[0].strip()
+
+    # Search by alias
+    response = requests.post(URL, data={"SearchString": alias}, timeout=20)
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    # Result items
+    items = soup.select("#results > ul > li") or soup.select("#results h3 + ul li")
+    if not items:
+        print("No results found.\n")
+        continue
+
+    # Collect minimal fields
+    people = []
+    for li in items:
+        table = li.find("table", class_="more")
+        if not table:
+            continue
+
+        def get(cls):
+            th = table.find("th", class_=cls)
+            return th.find_next_sibling("td").get_text(strip=True) if th else None
+
+        people.append({
+            "Alias": get("icon-key"),
+            "Title": get("icon-briefcase"),
+            "Department": get("icon-sitemap"),
+        })
+
+    # Exact alias match only
+    exact = [p for p in people if (p.get("Alias") or "").lower() == alias.lower()]
+    if not exact:
+        print("No exact alias match found.\n")
+        continue
+
+    for p in exact:
+        position = classify_position(p.get("Title"))
+        print(f"Position: {position}")
+        if p.get("Department"):
+            print(f"Department: {p['Department']}")
+        print()
