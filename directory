@@ -88,9 +88,7 @@ while True:
 
     for p in exact:
         position = classify_position(p.get("Title"))
-        print(f"Position: {position}")
-        if p.get("Department"):
-            print(f"Department: {p['Department']}")
-        print()
+        department = p.get("Department")
+
 
 
