@@ -4,7 +4,7 @@ from bs4 import BeautifulSoup
 
 URL = "https://www.purdue.edu/directory/"
 
-PROF_REGEX = re.compile(
+PROF_REGEX = re.compile( #Titles a professor can have on the directory
     r"""
     \b(
         professor|faculty|
@@ -18,8 +18,7 @@ PROF_REGEX = re.compile(
     re.I | re.X,
 )
 
-# TA is intentionally narrow (your request)
-TA_REGEX = re.compile(
+TA_REGEX = re.compile( #Titles a TA can have
     r"""
     \b(
         ta|
@@ -36,7 +35,6 @@ def classify_position(title: str | None) -> str:
     if not title:
         return "STUDENT"
     t = title.strip()
-    # Order matters: professor first (so GTA ⇒ PROFESSOR)
     if PROF_REGEX.search(t):
         return "PROFESSOR"
     if TA_REGEX.search(t):
@@ -47,7 +45,7 @@ def classify_position(title: str | None) -> str:
 while True:
     email_input = input("Enter Purdue email (or STOP): ").strip()
     alias_input, domain_input = email_input.split("@")
-    if domain_input != "purdue.edu":
+    if domain_input != "purdue.edu": #in case it is not a purdue.edu domain it breaks the loop
         print("Not a Purdue Email.")
         break
     if alias_input.upper() == "STOP":
@@ -94,4 +92,5 @@ while True:
         if p.get("Department"):
             print(f"Department: {p['Department']}")
         print()
+
 
