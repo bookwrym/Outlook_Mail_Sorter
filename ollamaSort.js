@@ -14,6 +14,7 @@ public class EmailClassifier {
         // Build prompt
         String prompt = "You are an email classification assistant.\n"
                 + "Choose EXACTLY ONE category from the following list:\n"
+        // Add directory variable position and department here
                 + String.join(", ", categories) + ".\n\n"
                 + "Respond ONLY with the category name.\n\n"
                 + "Email:\n" + emailText + "\n"
