@@ -1,0 +1,319 @@
+import msal
+import requests
+from collections import defaultdict
+import time
+
+# ==== CONFIG ====
+CLIENT_ID = "3855d74c-b67a-4843-a6a0-e64a9ff5696f"
+AUTHORITY = "https://login.microsoftonline.com/common"
+SCOPES = [
+    "User.Read",
+    "Mail.ReadWrite",
+    "MailboxFolder.ReadWrite"
+]
+
+GRAPH_API = "https://graph.microsoft.com/v1.0   "
+
+# How many messages to process when folderizing
+MAX_MESSAGES = 50   # start small; increase later
+
+
+def acquire_token():
+    app = msal.PublicClientApplication(
+        client_id=CLIENT_ID,
+        authority=AUTHORITY
+    )
+
+    accounts = app.get_accounts()
+    result = None
+    if accounts:
+        result = app.acquire_token_silent(SCOPES, account=accounts[0])
+
+    if not result:
+        result = app.acquire_token_interactive(scopes=SCOPES)
+
+    if "access_token" not in result:
+        raise Exception(
+            f"Could not acquire token: {result.get('error')} - {result.get('error_description')}"
+        )
+
+    return result["access_token"]
+
+
+def list_inbox_messages_paged(token, max_messages=MAX_MESSAGES, page_size=25):
+    """
+    Yield up to max_messages messages from the Inbox using paging.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    url = f"{GRAPH_API}/me/mailFolders/Inbox/messages"
+    params = {
+        "$top": page_size,
+        "$select": "id,subject,from"
+    }
+
+    fetched = 0
+    while url and fetched < max_messages:
+        resp = requests.get(url, headers=headers, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+
+        messages = data.get("value", [])
+        for msg in messages:
+            yield msg
+            fetched += 1
+            if fetched >= max_messages:
+                break
+
+        url = data.get("@odata.nextLink", None)
+        params = None  # nextLink already includes params
+
+
+def list_folder_messages_paged(token, folder_id, page_size=50):
+    """
+    Yield all messages in a given folder, paged.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    url = f"{GRAPH_API}/me/mailFolders/{folder_id}/messages?$top={page_size}"
+
+    while url:
+        resp = requests.get(url, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+
+        for msg in data.get("value", []):
+            yield msg
+
+        url = data.get("@odata.nextLink", None)
+
+
+def get_inbox_and_child_folders(token):
+    """
+    Return:
+      - inbox_id
+      - folders dict: { displayName.lower(): { 'id': folder_id, 'name': displayName } }
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # 1) Get Inbox folder id
+    inbox_resp = requests.get(f"{GRAPH_API}/me/mailFolders/Inbox", headers=headers)
+    inbox_resp.raise_for_status()
+    inbox = inbox_resp.json()
+    inbox_id = inbox["id"]
+
+    # 2) List child folders under Inbox
+    folders = {}
+    url = f"{GRAPH_API}/me/mailFolders/{inbox_id}/childFolders?$top=1000"
+    while url:
+        r = requests.get(url, headers=headers)
+        r.raise_for_status()
+        data = r.json()
+        for f in data.get("value", []):
+            name = f.get("displayName", "").strip()
+            key = name.lower()
+            folders[key] = {
+                "id": f["id"],
+                "name": name,
+            }
+
+        url = data.get("@odata.nextLink", None)
+
+    print(f"Found {len(folders)} existing child folders under Inbox.")
+    return inbox_id, folders
+
+
+def make_folder_resolver(token, inbox_id, folders_dict):
+    """
+    Given inbox_id and existing folders, return a function
+    that maps sender_email -> folder_id (creating folder if needed).
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+
+    def get_folder_id_for_sender(sender_email: str) -> str:
+        nonlocal folders_dict
+
+        if not sender_email:
+            sender_email = "unknown-sender"
+
+        display_name = sender_email.strip()
+        key = display_name.lower()
+
+        if key in folders_dict:
+            return folders_dict[key]["id"]
+
+        # Folder doesn't exist yet, create it
+        print(f"Creating folder for sender: {display_name}")
+        create_resp = requests.post(
+            f"{GRAPH_API}/me/mailFolders/{inbox_id}/childFolders",
+            headers={**headers, "Content-Type": "application/json"},
+            json={"displayName": display_name}
+        )
+        create_resp.raise_for_status()
+        new_folder = create_resp.json()
+        folder_id = new_folder["id"]
+        folders_dict[key] = {"id": folder_id, "name": display_name}
+        return folder_id
+
+    return get_folder_id_for_sender
+
+
+def move_message_to_folder(token, message_id: str, dest_folder_id: str):
+    """
+    Move a message to a specific folder by ID.
+    Returns the moved message JSON (including its NEW id).
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    url = f"{GRAPH_API}/me/messages/{message_id}/move"
+    payload = {"destinationId": dest_folder_id}
+
+    resp = requests.post(url, headers=headers, json=payload)
+    resp.raise_for_status()
+    return resp.json()
+
+
+# =============== MODE 1: FOLDERIZE BY SENDER ===============
+
+def folderize_inbox_by_sender(token):
+    inbox_id, folders = get_inbox_and_child_folders(token)
+    get_folder_for_sender = make_folder_resolver(token, inbox_id, folders)
+
+    print(f"\nFolderizing up to {MAX_MESSAGES} messages from Inbox by sender...\n")
+
+    moved_count = 0
+    per_sender_count = defaultdict(int)
+
+    for msg in list_inbox_messages_paged(token, max_messages=MAX_MESSAGES, page_size=25):
+        msg_id = msg["id"]
+        from_obj = msg.get("from", {}).get("emailAddress", {})
+        sender_email = from_obj.get("address", "").lower()
+
+        if not sender_email:
+            sender_email = "unknown-sender"
+
+        folder_id = get_folder_for_sender(sender_email)
+
+        try:
+            moved_msg = move_message_to_folder(token, msg_id, folder_id)
+        except requests.HTTPError as e:
+            print(f"Error moving message {msg_id}: {e}")
+            continue
+
+        moved_count += 1
+        per_sender_count[sender_email] += 1
+
+        print(f"[{moved_count}] Moved message from {sender_email} to folder '{sender_email}'")
+
+        time.sleep(0.1)  # be kind to Graph
+
+    print("\n✅ Folderize done.")
+    print(f"Total messages moved this run: {moved_count}")
+    print("Messages per sender (this run):")
+    for sender, count in per_sender_count.items():
+        print(f"  {sender}: {count}")
+
+
+# =============== MODE 2: DEFOLDERIZE ===============
+
+def is_sender_folder(name: str) -> bool:
+    """
+    Decide if a folder looks like one of our 'sender-based' folders.
+    Right now: contains '@' OR equals 'unknown-sender' (case-insensitive).
+    Change this if you want to be more/less aggressive.
+    """
+    lower = name.lower()
+    return "@" in lower or lower == "unknown-sender"
+
+def delete_folder(token, folder_id: str, folder_name: str):
+    """
+    Delete a mail folder by ID.
+    Does NOT delete messages already moved out of it.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    url = f"{GRAPH_API}/me/mailFolders/{folder_id}"
+
+    resp = requests.delete(url, headers=headers)
+    if resp.status_code in (204,):
+        print(f"  Deleted folder '{folder_name}'")
+    else:
+        print(f"  Failed to delete folder '{folder_name}': {resp.status_code} {resp.text}")
+
+
+def defolderize_sender_folders(token):
+    inbox_id, folders = get_inbox_and_child_folders(token)
+
+    # Pick only folders that look like sender-based (email-ish names)
+    sender_folders = {
+        key: info for key, info in folders.items() if is_sender_folder(info["name"])
+    }
+
+    if not sender_folders:
+        print("\nNo sender-like folders found under Inbox (nothing to defolderize).")
+        return
+
+    print("\nThe following folders will be defolderized (messages moved back to Inbox and folders deleted):")
+    for info in sender_folders.values():
+        print(f"  - {info['name']}")
+
+    choice = input(
+        "\nAre you SURE you want to move ALL messages from these folders back to Inbox "
+        "and DELETE the folders? (y/N): "
+    ).strip().lower()
+    if not choice.startswith("y"):
+        print("Defolderize canceled.")
+        return
+
+    total_moved = 0
+    for key, info in sender_folders.items():
+        folder_id = info["id"]
+        folder_name = info["name"]
+        print(f"\nProcessing folder: {folder_name}")
+
+        moved_in_folder = 0
+        # 1) Move all messages from this folder back to Inbox
+        for msg in list_folder_messages_paged(token, folder_id, page_size=50):
+            msg_id = msg["id"]
+            try:
+                move_message_to_folder(token, msg_id, inbox_id)
+                moved_in_folder += 1
+                total_moved += 1
+                print(f"  Moved message {msg_id} back to Inbox")
+                time.sleep(0.05)
+            except requests.HTTPError as e:
+                print(f"  Error moving message {msg_id}: {e}")
+
+        print(f"  Folder '{folder_name}': moved {moved_in_folder} messages.")
+
+        # 2) Delete the now-empty folder
+        delete_folder(token, folder_id, folder_name)
+
+    print(f"\n✅ Defolderize complete. Total messages moved back to Inbox: {total_moved}")
+    print("All sender-based folders above have been deleted.")
+
+
+# =============== MAIN MENU ===============
+
+def main():
+    print("Acquiring token via MSAL...")
+    token = acquire_token()
+    print("✅ Token acquired.\n")
+
+    print("Choose an action:")
+    print("  1) Folderize Inbox by sender (create/move into sender@address.com folders)")
+    print("  2) Defolderize: move messages from sender-based folders back to Inbox")
+    choice = input("\nEnter 1 or 2: ").strip()
+
+    if choice == "1":
+        folderize_inbox_by_sender(token)
+    elif choice == "2":
+        defolderize_sender_folders(token)
+    else:
+        print("No valid choice entered. Exiting.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
