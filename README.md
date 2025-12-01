@@ -1,6 +1,7 @@
 # 📌 Outlook Email Organizer + AI Summarizer  
 ### *Project Overview (Obsidian Note)*  
 **Author:** Rayed Rahman, Hruday Tamboli, Owen Krepsik, Luiz Octavio, Jona Yan, Kotaro Tomas
+
 **Status:** 🚧 *In Progress*  
 **Goal:** Build a complete Outlook Add-in + backend system that can:  
 ✔️ Read the user’s inbox  
